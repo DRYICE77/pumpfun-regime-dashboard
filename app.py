@@ -28,6 +28,43 @@ query_id = os.getenv("DUNE_QUERY_ID", "")
 default_lookback = int(os.getenv("LOOKBACK_DAYS", "30"))
 
 # ----------------------------
+# Session state (init early)
+# ----------------------------
+if "last_execution_id" not in st.session_state:
+    st.session_state["last_execution_id"] = None
+if "last_refresh_mode" not in st.session_state:
+    st.session_state["last_refresh_mode"] = "cached"
+if "last_fresh_state" not in st.session_state:
+    st.session_state["last_fresh_state"] = None
+if "data_origin" not in st.session_state:
+    st.session_state["data_origin"] = "cached"
+if "refresh_action" not in st.session_state:
+    st.session_state["refresh_action"] = None  # "fast" | "fresh" | "retry" | None
+
+def trigger(action: str):
+    st.session_state["refresh_action"] = action
+
+# ----------------------------
+# Quick Actions (VISIBLE ON MOBILE)
+# ----------------------------
+st.markdown("### Quick Actions")
+qa1, qa2, qa3 = st.columns(3)
+
+with qa1:
+    if st.button("⚡ Fast", use_container_width=True, key="top_fast"):
+        trigger("fast")
+
+with qa2:
+    if st.button("🔥 Fresh", use_container_width=True, key="top_fresh"):
+        trigger("fresh")
+
+with qa3:
+    if st.button("🔁 Fetch", use_container_width=True, key="top_retry"):
+        trigger("retry")
+
+st.divider()
+
+# ----------------------------
 # Sidebar controls
 # ----------------------------
 with st.sidebar:
@@ -39,9 +76,12 @@ with st.sidebar:
     st.divider()
     st.subheader("Refresh")
 
-    fast_refresh = st.button("⚡ Fast Refresh (cached)", use_container_width=True)
-    run_fresh = st.button("🔥 Run Fresh Query", use_container_width=True)
-    retry_fetch = st.button("🔁 Fetch Last Fresh Result", use_container_width=True)
+    if st.button("⚡ Fast Refresh (cached)", use_container_width=True, key="sb_fast"):
+        trigger("fast")
+    if st.button("🔥 Run Fresh Query", use_container_width=True, key="sb_fresh"):
+        trigger("fresh")
+    if st.button("🔁 Fetch Last Fresh Result", use_container_width=True, key="sb_retry"):
+        trigger("retry")
 
     st.caption(
         "Fast refresh pulls Dune’s latest stored results. "
@@ -125,15 +165,12 @@ def score_from_4_ratios(vol_ratio: float, vpt_ratio: float, tokens_ratio: float,
 
     Graduation is the "market produces winners" signal.
     """
-    # quality + flow
     quality = norm_log_ratio(vpt_ratio, k=0.45)
     flow = norm_log_ratio(vol_ratio, k=0.35)
 
-    # crowding (invert)
     lt = np.log(tokens_ratio) if tokens_ratio and np.isfinite(tokens_ratio) and tokens_ratio > 0 else 0.0
     crowd = clamp(0.5 - 0.30 * lt)
 
-    # graduation (slightly more sensitive)
     grad = norm_log_ratio(grad_ratio, k=0.60)
 
     raw = (
@@ -145,15 +182,12 @@ def score_from_4_ratios(vol_ratio: float, vpt_ratio: float, tokens_ratio: float,
     return int(round(100 * clamp(raw)))
 
 def regime_label(vol_ratio: float, vpt_ratio: float, tokens_ratio: float, grad_ratio: float):
-    # GREEN: winners + quality + not overcrowded
     if grad_ratio >= 1.10 and vpt_ratio >= 1.05 and vol_ratio >= 1.00 and tokens_ratio <= 1.20:
         return "GREEN", "Strong winners + quality flow"
 
-    # RED: environment not producing winners (often scam/no-meta days)
     if grad_ratio < 0.85:
         return "RED", "Low graduations (bad environment)"
 
-    # RED: classic crowded + low quality
     if vpt_ratio < 0.90 and tokens_ratio > 1.05:
         return "RED", "Crowded + low quality"
 
@@ -165,17 +199,14 @@ def regime_badge(regime: str) -> str:
 def compute_features(df: pd.DataFrame, window: int) -> pd.DataFrame:
     d = df.copy().sort_values("day")
 
-    # rolling medians (core)
     d["vol_med"] = d["volume"].rolling(window).median()
     d["tok_med"] = d["tokens_created"].rolling(window).median()
     d["vpt_med"] = d["volume_per_token"].rolling(window).median()
 
-    # ratios vs rolling median
     d["vol_ratio"] = d["volume"] / d["vol_med"]
     d["tokens_ratio"] = d["tokens_created"] / d["tok_med"]
     d["vpt_ratio"] = d["volume_per_token"] / d["vpt_med"]
 
-    # graduation (optional but required for 4-factor score)
     if "grad_rate" in d.columns:
         d["grad_med"] = d["grad_rate"].rolling(window).median()
         d["grad_ratio"] = d["grad_rate"] / d["grad_med"]
@@ -184,7 +215,6 @@ def compute_features(df: pd.DataFrame, window: int) -> pd.DataFrame:
         d["grad_med"] = np.nan
         d["grad_ratio"] = np.nan
 
-    # score (only where all 4 ratios exist)
     d["regime_score"] = d.apply(
         lambda r: score_from_4_ratios(
             r["vol_ratio"], r["vpt_ratio"], r["tokens_ratio"], r["grad_ratio"]
@@ -197,29 +227,20 @@ def compute_features(df: pd.DataFrame, window: int) -> pd.DataFrame:
     return d
 
 # ----------------------------
-# Session state
-# ----------------------------
-if "last_execution_id" not in st.session_state:
-    st.session_state["last_execution_id"] = None
-if "last_refresh_mode" not in st.session_state:
-    st.session_state["last_refresh_mode"] = "cached"
-if "last_fresh_state" not in st.session_state:
-    st.session_state["last_fresh_state"] = None
-if "data_origin" not in st.session_state:
-    st.session_state["data_origin"] = "cached"
-
-# ----------------------------
-# Data load / refresh logic (resilient)
+# Data load / refresh logic (single-source action)
 # ----------------------------
 df = None
+action = st.session_state.get("refresh_action", None)
 
-if fast_refresh:
+# Fast refresh: clear cache then load cached results
+if action == "fast":
     st.cache_data.clear()
     st.session_state["last_refresh_mode"] = "cached"
     st.session_state["data_origin"] = "cached"
     st.session_state["last_fresh_state"] = None
 
-if retry_fetch:
+# Retry fetch: attempt to fetch results for last execution without re-running
+if action == "retry":
     exid = st.session_state.get("last_execution_id")
     if not exid:
         st.info("No previous fresh execution found. Click “Run Fresh Query” first.")
@@ -246,7 +267,8 @@ if retry_fetch:
             st.session_state["last_refresh_mode"] = "cached"
             st.session_state["data_origin"] = "cached"
 
-if run_fresh and df is None:
+# Run fresh: trigger new execution, wait best-effort, fetch if ready; otherwise fall back
+if action == "fresh" and df is None:
     try:
         with st.spinner("Triggering fresh Dune execution..."):
             execution_id, df_fresh, state = try_run_and_fetch(
@@ -274,27 +296,28 @@ if run_fresh and df is None:
         st.session_state["last_refresh_mode"] = "cached"
         st.session_state["data_origin"] = "cached"
 
+# Default: cached results
 if df is None:
     df = load_data_cached(query_id, api_key)
     st.session_state["last_refresh_mode"] = "cached"
     st.session_state["data_origin"] = "cached"
+
+# IMPORTANT: clear action so it doesn't retrigger on the next rerun
+st.session_state["refresh_action"] = None
 
 # ----------------------------
 # Clean + normalize schema
 # ----------------------------
 df = pick_columns(df)
 
-# Ensure numeric types
 for col in ["volume", "tokens_created", "volume_per_token"]:
     df[col] = pd.to_numeric(df[col], errors="coerce")
 
-# Graduation fields (optional but needed for 4-factor score)
 if "grad_rate" in df.columns:
     df["grad_rate"] = pd.to_numeric(df["grad_rate"], errors="coerce")
 if "graduated_tokens" in df.columns:
     df["graduated_tokens"] = pd.to_numeric(df["graduated_tokens"], errors="coerce")
 
-# Drop the core missing, keep grad_rate even if missing (we'll warn later)
 df = df.dropna(subset=["day", "volume", "tokens_created"])
 df = normalize_day(df)
 
@@ -304,7 +327,6 @@ df = normalize_day(df)
 window = max(7, int(lookback))
 df_feat = compute_features(df, window)
 
-# Require score rows (needs grad_ratio too)
 df_valid = df_feat[df_feat["regime_score"].notna()].sort_values("day").tail(int(lookback))
 
 if df_valid.empty:
