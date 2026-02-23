@@ -25,7 +25,7 @@ st.caption(
 
 api_key = os.getenv("DUNE_API_KEY", "")
 query_id = os.getenv("DUNE_QUERY_ID", "")
-default_lookback = int(os.getenv("LOOKBACK_DAYS", "30"))
+default_lookback = int(os.getenv("LOOKBACK_DAYS", "31"))
 
 # ----------------------------
 # Session state (init early)
@@ -41,8 +41,19 @@ if "data_origin" not in st.session_state:
 if "refresh_action" not in st.session_state:
     st.session_state["refresh_action"] = None  # "fast" | "fresh" | "retry" | None
 
+# Lookback state (buttons)
+if "lookback" not in st.session_state:
+    # force into one of the button options for a cleaner UX
+    st.session_state["lookback"] = default_lookback if default_lookback in (7, 14, 21, 31) else 31
+
+
 def trigger(action: str):
     st.session_state["refresh_action"] = action
+
+
+def set_lookback(days: int):
+    st.session_state["lookback"] = int(days)
+
 
 # ----------------------------
 # Quick Actions (VISIBLE ON MOBILE)
@@ -65,12 +76,44 @@ with qa3:
 st.divider()
 
 # ----------------------------
-# Sidebar controls
+# Lookback buttons (VISIBLE ON MOBILE)
+# ----------------------------
+st.markdown("### Lookback")
+
+# A little UI label that shows what's selected
+selected = int(st.session_state["lookback"])
+st.caption(f"Selected lookback: **{selected} days**")
+
+b1, b2, b3, b4 = st.columns(4)
+
+def button_label(days: int) -> str:
+    return f"✅ {days}d" if selected == days else f"{days}d"
+
+with b1:
+    if st.button(button_label(7), use_container_width=True, key="lb_7"):
+        set_lookback(7)
+with b2:
+    if st.button(button_label(14), use_container_width=True, key="lb_14"):
+        set_lookback(14)
+with b3:
+    if st.button(button_label(21), use_container_width=True, key="lb_21"):
+        set_lookback(21)
+with b4:
+    if st.button(button_label(31), use_container_width=True, key="lb_31"):
+        set_lookback(31)
+
+# Re-read after button press (Streamlit reruns)
+lookback = int(st.session_state["lookback"])
+window = max(7, lookback)
+
+st.divider()
+
+# ----------------------------
+# Sidebar controls (no sliders; shows selected)
 # ----------------------------
 with st.sidebar:
     st.header("Settings")
-
-    lookback = st.slider("Rolling window (days)", 7, 60, default_lookback, 1)
+    st.write(f"Lookback (days): **{lookback}**")
     st.text_input("Dune Query ID", value=query_id, disabled=True)
 
     st.divider()
@@ -324,10 +367,13 @@ df = normalize_day(df)
 # ----------------------------
 # Feature engineering
 # ----------------------------
-window = max(7, int(lookback))
 df_feat = compute_features(df, window)
 
-df_valid = df_feat[df_feat["regime_score"].notna()].sort_values("day").tail(int(lookback))
+df_valid = (
+    df_feat[df_feat["regime_score"].notna()]
+    .sort_values("day")
+    .tail(int(lookback))
+)
 
 if df_valid.empty:
     if "grad_rate" not in df.columns:
@@ -381,17 +427,7 @@ with c6:
     else:
         st.caption("Today grad rate: n/a")
 
-
-# Mobile-friendly lookback control (main page)
-lookback = st.slider(
-    "Rolling window (days)",
-    min_value=7,
-    max_value=60,
-    value=default_lookback,
-    step=1,
-    help="Controls the rolling median window used to compute the ratios + regime score.",
-)
-
+st.divider()
 
 # ----------------------------
 # Freshness / execution info
