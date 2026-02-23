@@ -381,6 +381,18 @@ with c6:
     else:
         st.caption("Today grad rate: n/a")
 
+
+# Mobile-friendly lookback control (main page)
+lookback = st.slider(
+    "Rolling window (days)",
+    min_value=7,
+    max_value=60,
+    value=default_lookback,
+    step=1,
+    help="Controls the rolling median window used to compute the ratios + regime score.",
+)
+
+
 # ----------------------------
 # Freshness / execution info
 # ----------------------------
