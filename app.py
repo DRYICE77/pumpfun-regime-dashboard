@@ -37,24 +37,81 @@ if not api_key or not query_id:
     st.stop()
 
 # ----------------------------
-# Sidebar controls
+# Session state (init)
+# ----------------------------
+if "last_execution_id" not in st.session_state:
+    st.session_state["last_execution_id"] = None
+if "last_fresh_state" not in st.session_state:
+    st.session_state["last_fresh_state"] = None
+if "data_origin" not in st.session_state:
+    st.session_state["data_origin"] = "cached"
+if "lookback_days" not in st.session_state:
+    st.session_state["lookback_days"] = default_lookback
+
+# ----------------------------
+# Mobile-friendly controls (main page)
+# Put controls HERE so they appear on mobile even when sidebar is collapsed
+# ----------------------------
+with st.expander("Controls", expanded=False):
+    st.caption("These controls are duplicated in the sidebar for desktop convenience.")
+    r1c1, r1c2, r1c3 = st.columns(3)
+    with r1c1:
+        fast_refresh_main = st.button("⚡ Fast Refresh", use_container_width=True, key="fast_refresh_main")
+    with r1c2:
+        run_fresh_main = st.button("🔥 Run Fresh", use_container_width=True, key="run_fresh_main")
+    with r1c3:
+        retry_fetch_main = st.button("🔁 Fetch Last", use_container_width=True, key="retry_fetch_main")
+
+    lookback_main = st.slider(
+        "Rolling window (days)",
+        7,
+        60,
+        int(st.session_state["lookback_days"]),
+        1,
+        key="lookback_days_main",
+        help="Controls the rolling median window used to compute ratios + regime score.",
+    )
+    # sync back (so sidebar + logic share one value)
+    st.session_state["lookback_days"] = int(lookback_main)
+
+# ----------------------------
+# Sidebar controls (desktop)
 # ----------------------------
 with st.sidebar:
     st.header("Settings")
-    lookback = st.slider("Rolling window (days)", 7, 60, default_lookback, 1)
+
+    lookback_side = st.slider(
+        "Rolling window (days)",
+        7,
+        60,
+        int(st.session_state["lookback_days"]),
+        1,
+        key="lookback_days_sidebar",
+    )
+    st.session_state["lookback_days"] = int(lookback_side)
+
     st.text_input("Dune Query ID", value=query_id, disabled=True)
 
     st.divider()
     st.subheader("Refresh")
-    fast_refresh = st.button("⚡ Fast Refresh (cached)", use_container_width=True)
-    run_fresh = st.button("🔥 Run Fresh Query", use_container_width=True)
-    retry_fetch = st.button("🔁 Fetch Last Fresh Result", use_container_width=True)
+
+    fast_refresh_side = st.button("⚡ Fast Refresh (cached)", use_container_width=True, key="fast_refresh_side")
+    run_fresh_side = st.button("🔥 Run Fresh Query", use_container_width=True, key="run_fresh_side")
+    retry_fetch_side = st.button("🔁 Fetch Last Fresh Result", use_container_width=True, key="retry_fetch_side")
 
     st.caption(
         "Fast refresh pulls Dune’s latest stored results. "
         "Run Fresh Query triggers a fresh execution. "
         "If the fresh run isn’t ready yet, the app shows cached results and you can fetch later."
     )
+
+# unify button actions from either UI location
+fast_refresh = bool(fast_refresh_main) or bool(fast_refresh_side)
+run_fresh = bool(run_fresh_main) or bool(run_fresh_side)
+retry_fetch = bool(retry_fetch_main) or bool(retry_fetch_side)
+
+# final lookback used by the app
+lookback = int(st.session_state["lookback_days"])
 
 # ----------------------------
 # Caching (cached endpoint)
@@ -70,7 +127,6 @@ def normalize_day(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
     out["day"] = pd.to_datetime(out["day"], errors="coerce", utc=True)
     out = out.dropna(subset=["day"]).sort_values("day")
-    # keep as UTC midnight timestamps (works fine for charts); also store a date for display if you want
     out["day_date"] = out["day"].dt.date
     return out
 
@@ -89,7 +145,6 @@ def pick_columns(df: pd.DataFrame) -> pd.DataFrame:
     """
     out = df.copy()
 
-    # normalize naming
     if "volume" not in out.columns and "volume_sol" in out.columns:
         out = out.rename(columns={"volume_sol": "volume"})
     if "volume_to_now" not in out.columns and "volume_to_now_sol" in out.columns:
@@ -123,7 +178,7 @@ def pick_columns(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 # ----------------------------
-# Regime math (4-factor)
+# Regime math
 # ----------------------------
 def clamp(x, lo=0.0, hi=1.0):
     return max(lo, min(hi, x))
@@ -137,19 +192,38 @@ def norm_log_ratio(r: float, k: float) -> float:
         return 0.0
     return clamp(0.5 + k * float(np.log(r)))
 
+def crowding_component(tokens_ratio: float, grad_ratio: float, k: float = 0.30, a: float = 1.5) -> float:
+    """
+    Contextual crowding:
+      - If grad_ratio > 1 (strong environment), higher tokens_ratio is bullish (reward)
+      - If grad_ratio < 1 (weak environment), higher tokens_ratio is bearish (penalize)
+
+    Smoothly controlled by:
+      g = tanh(a * log(grad_ratio)) in [-1, +1]
+      crowd = 0.5 + k * g * log(tokens_ratio)
+    """
+    if tokens_ratio is None or not np.isfinite(tokens_ratio) or tokens_ratio <= 0:
+        return 0.5
+    if grad_ratio is None or not np.isfinite(grad_ratio) or grad_ratio <= 0:
+        return 0.5
+
+    t = float(np.log(tokens_ratio))
+    g = float(np.tanh(a * np.log(grad_ratio)))  # -1..+1
+    return clamp(0.5 + k * g * t)
+
 def score_from_metrics(vol_ratio: float, grad_ratio: float, grad_speed_ratio: float, tokens_ratio: float) -> int:
     """
-    Graduation likelihood (grad_rate vs median) 35%
-    Graduation speed (faster vs median)         30%  (lower minutes_to_grad is better -> invert)
-    Flow (volume vs median)                     20%
-    Crowding inverse (tokens vs median)         15%  (more tokens => worse)
+    4-factor regime score:
+
+      Graduation likelihood (grad_rate vs median) 35%
+      Graduation speed (faster vs median)         30%  (lower minutes_to_grad is better -> invert)
+      Flow (volume vs median)                     20%
+      Crowding (contextual)                       15%  (reward in strong env; penalize in weak env)
     """
     flow = norm_log_ratio(vol_ratio, k=0.35)
     grad = norm_log_ratio(grad_ratio, k=0.60)
     speed = norm_log_ratio(grad_speed_ratio, k=0.50)
-
-    lt = np.log(tokens_ratio) if tokens_ratio and np.isfinite(tokens_ratio) and tokens_ratio > 0 else 0.0
-    crowd = clamp(0.5 - 0.30 * lt)
+    crowd = crowding_component(tokens_ratio, grad_ratio, k=0.30, a=1.5)
 
     raw = (
         0.20 * flow +
@@ -164,7 +238,7 @@ def regime_label(vol_ratio: float, tokens_ratio: float, grad_ratio: float, grad_
     Labels tuned for "runner likelihood".
     grad_speed_ratio > 1 means faster-than-median graduation.
     """
-    if grad_ratio >= 1.10 and grad_speed_ratio >= 1.10 and tokens_ratio <= 1.25:
+    if grad_ratio >= 1.10 and grad_speed_ratio >= 1.10 and tokens_ratio <= 1.35:
         return "GREEN", "High graduations + fast bonding curve (runner environment)"
 
     if grad_ratio < 0.85:
@@ -173,6 +247,7 @@ def regime_label(vol_ratio: float, tokens_ratio: float, grad_ratio: float, grad_
     if grad_speed_ratio < 0.85:
         return "RED", "Slow graduations (grind/distribution; fewer runners)"
 
+    # If grads are weak, and it's crowded, that’s usually extraction
     if tokens_ratio > 1.20 and grad_ratio < 1.00:
         return "RED", "Crowded + not enough winners"
 
@@ -185,7 +260,7 @@ def compute_features(df: pd.DataFrame, window: int) -> pd.DataFrame:
     d = df.copy().sort_values("day")
 
     # rolling medians
-    # IMPORTANT: Flow + Crowding use intraday-aligned series
+    # Flow + Crowding use intraday-aligned series
     d["vol_med"] = d["volume_to_now"].rolling(window).median()
     d["tok_med"] = d["tokens_created_to_now"].rolling(window).median()
 
@@ -210,17 +285,10 @@ def compute_features(df: pd.DataFrame, window: int) -> pd.DataFrame:
         axis=1,
     )
 
-    return d
+    # Optional debug: show whether crowding was being treated bullish or bearish
+    d["crowd_sign"] = np.sign(np.log(d["grad_ratio"].clip(lower=1e-9)))  # + if grad_ratio>1, - if <1 (approx)
 
-# ----------------------------
-# Session state
-# ----------------------------
-if "last_execution_id" not in st.session_state:
-    st.session_state["last_execution_id"] = None
-if "last_fresh_state" not in st.session_state:
-    st.session_state["last_fresh_state"] = None
-if "data_origin" not in st.session_state:
-    st.session_state["data_origin"] = "cached"
+    return d
 
 # ----------------------------
 # Data load / refresh logic (resilient)
@@ -298,14 +366,23 @@ num_cols = [
     "graduated_tokens",
     "grad_rate",
     "median_minutes_to_grad",
-    # optional:
-    "cutoff_seconds",
+    "cutoff_seconds",  # optional
 ]
 for col in num_cols:
     if col in df.columns:
         df[col] = pd.to_numeric(df[col], errors="coerce")
 
-df = df.dropna(subset=["day", "volume", "tokens_created", "volume_to_now", "tokens_created_to_now", "grad_rate", "median_minutes_to_grad"])
+df = df.dropna(
+    subset=[
+        "day",
+        "volume",
+        "tokens_created",
+        "volume_to_now",
+        "tokens_created_to_now",
+        "grad_rate",
+        "median_minutes_to_grad",
+    ]
+)
 df = normalize_day(df)
 
 # ----------------------------
@@ -313,8 +390,6 @@ df = normalize_day(df)
 # ----------------------------
 window = max(7, int(lookback))
 df_feat = compute_features(df, window)
-
-# use the last `lookback` days where score is available
 df_valid = df_feat[df_feat["regime_score"].notna()].sort_values("day").tail(window)
 
 if df_valid.empty:
@@ -365,7 +440,9 @@ with c5:
 with c6:
     st.caption("Crowding ratio (intraday vs median)")
     st.metric(label="", value=f"{tok_ratio:.2f}x")
-    st.caption(f"Rolling median window: {window}d")
+    # show how crowding is being interpreted right now
+    crowd_mode = "Bullish (rotation / mania)" if grad_ratio >= 1.0 else "Bearish (extraction / scams)"
+    st.caption(f"Mode: {crowd_mode} • Rolling median window: {window}d")
 
 # ----------------------------
 # Freshness / execution info
@@ -401,7 +478,6 @@ if max_day is not None:
 if row_count is not None:
     fresh_bits.append(f"Rows: **{row_count}**")
 
-# show intraday cutoff (nice sanity check)
 if "cutoff_seconds" in df.columns and pd.notna(latest.get("cutoff_seconds", np.nan)):
     cutoff_seconds = float(latest["cutoff_seconds"])
     fresh_bits.append(f"UTC cutoff: **{cutoff_seconds/3600:.2f}h** after midnight")
@@ -417,7 +493,7 @@ else:
 st.divider()
 
 # ----------------------------
-# Charts (ratios + score)
+# Charts
 # ----------------------------
 st.subheader("Regime Signals")
 
