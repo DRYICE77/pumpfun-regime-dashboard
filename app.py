@@ -297,12 +297,6 @@ for col in ["volume", "tokens_created", "graduated_tokens", "grad_rate", "median
 df = df.dropna(subset=["day", "volume", "tokens_created", "grad_rate", "median_minutes_to_grad"])
 df = normalize_day(df)
 
-# Ensure day is normalized to midnight
-df["day"] = pd.to_datetime(df["day"], errors="coerce").dt.normalize()
-
-today_utc = pd.Timestamp.utcnow().normalize()
-df = df[df["day"] < today_utc]
-
 # ----------------------------
 # Feature engineering
 # ----------------------------
