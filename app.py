@@ -20,111 +20,29 @@ load_dotenv()
 st.set_page_config(page_title="Pump.fun Regime Dashboard", layout="wide")
 st.title("Pump.fun Regime Dashboard")
 st.caption(
-    "Signal-first view: ratios vs rolling median + regime score (raw volumes are treated as units; focus on ratios)."
+    "Signal-first view: ratios vs rolling median + regime score. "
+    "Core thesis: runner environments show up as HIGH grad rate + FAST graduation speed."
 )
 
 api_key = os.getenv("DUNE_API_KEY", "")
 query_id = os.getenv("DUNE_QUERY_ID", "")
-default_lookback = int(os.getenv("LOOKBACK_DAYS", "31"))
+default_lookback = int(os.getenv("LOOKBACK_DAYS", "30"))
 
 # ----------------------------
-# Session state (init early)
-# ----------------------------
-if "last_execution_id" not in st.session_state:
-    st.session_state["last_execution_id"] = None
-if "last_refresh_mode" not in st.session_state:
-    st.session_state["last_refresh_mode"] = "cached"
-if "last_fresh_state" not in st.session_state:
-    st.session_state["last_fresh_state"] = None
-if "data_origin" not in st.session_state:
-    st.session_state["data_origin"] = "cached"
-if "refresh_action" not in st.session_state:
-    st.session_state["refresh_action"] = None  # "fast" | "fresh" | "retry" | None
-
-# Lookback state (buttons)
-if "lookback" not in st.session_state:
-    # force into one of the button options for a cleaner UX
-    st.session_state["lookback"] = default_lookback if default_lookback in (7, 14, 21, 31) else 31
-
-
-def trigger(action: str):
-    st.session_state["refresh_action"] = action
-
-
-def set_lookback(days: int):
-    st.session_state["lookback"] = int(days)
-
-
-# ----------------------------
-# Quick Actions (VISIBLE ON MOBILE)
-# ----------------------------
-st.markdown("### Quick Actions")
-qa1, qa2, qa3 = st.columns(3)
-
-with qa1:
-    if st.button("⚡ Fast", use_container_width=True, key="top_fast"):
-        trigger("fast")
-
-with qa2:
-    if st.button("🔥 Fresh", use_container_width=True, key="top_fresh"):
-        trigger("fresh")
-
-with qa3:
-    if st.button("🔁 Fetch", use_container_width=True, key="top_retry"):
-        trigger("retry")
-
-st.divider()
-
-# ----------------------------
-# Lookback buttons (VISIBLE ON MOBILE)
-# ----------------------------
-st.markdown("### Lookback")
-
-# A little UI label that shows what's selected
-selected = int(st.session_state["lookback"])
-st.caption(f"Selected lookback: **{selected} days**")
-
-b1, b2, b3, b4 = st.columns(4)
-
-def button_label(days: int) -> str:
-    return f"✅ {days}d" if selected == days else f"{days}d"
-
-with b1:
-    if st.button(button_label(7), use_container_width=True, key="lb_7"):
-        set_lookback(7)
-with b2:
-    if st.button(button_label(14), use_container_width=True, key="lb_14"):
-        set_lookback(14)
-with b3:
-    if st.button(button_label(21), use_container_width=True, key="lb_21"):
-        set_lookback(21)
-with b4:
-    if st.button(button_label(31), use_container_width=True, key="lb_31"):
-        set_lookback(31)
-
-# Re-read after button press (Streamlit reruns)
-lookback = int(st.session_state["lookback"])
-window = max(7, lookback)
-
-st.divider()
-
-# ----------------------------
-# Sidebar controls (no sliders; shows selected)
+# Sidebar controls
 # ----------------------------
 with st.sidebar:
     st.header("Settings")
-    st.write(f"Lookback (days): **{lookback}**")
+
+    lookback = st.slider("Rolling window (days)", 7, 60, default_lookback, 1)
     st.text_input("Dune Query ID", value=query_id, disabled=True)
 
     st.divider()
     st.subheader("Refresh")
 
-    if st.button("⚡ Fast Refresh (cached)", use_container_width=True, key="sb_fast"):
-        trigger("fast")
-    if st.button("🔥 Run Fresh Query", use_container_width=True, key="sb_fresh"):
-        trigger("fresh")
-    if st.button("🔁 Fetch Last Fresh Result", use_container_width=True, key="sb_retry"):
-        trigger("retry")
+    fast_refresh = st.button("⚡ Fast Refresh (cached)", use_container_width=True)
+    run_fresh = st.button("🔥 Run Fresh Query", use_container_width=True)
+    retry_fetch = st.button("🔁 Fetch Last Fresh Result", use_container_width=True)
 
     st.caption(
         "Fast refresh pulls Dune’s latest stored results. "
@@ -157,24 +75,25 @@ def normalize_day(df: pd.DataFrame) -> pd.DataFrame:
 
 def pick_columns(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Supports schemas:
-      - day, volume_sol, tokens_created, volume_per_token (+ optional: graduated_tokens, grad_rate, as_of_ts...)
-      - day, volume,     tokens_created, volume_per_token (+ optional: graduated_tokens, grad_rate, as_of_ts...)
-    Normalizes to: day, volume, tokens_created, volume_per_token
-    Leaves extra columns intact.
+    Expected schema (new):
+      - day, volume_sol (or volume), tokens_created
+      - graduated_tokens, grad_rate
+      - median_minutes_to_grad (NEW)
+    Extra columns allowed: as_of_ts, day_rows, max_day, grads_with_launch_time, etc.
+
+    Normalizes to: day, volume, tokens_created, grad_rate, graduated_tokens, median_minutes_to_grad (if present).
     """
     out = df.copy()
 
     if "volume" not in out.columns and "volume_sol" in out.columns:
         out = out.rename(columns={"volume_sol": "volume"})
 
-    required = {"day", "volume", "tokens_created", "volume_per_token"}
+    required = {"day", "volume", "tokens_created", "grad_rate", "graduated_tokens", "median_minutes_to_grad"}
     missing = required - set(out.columns)
     if missing:
         st.error(
-            "Your Dune query must return either:\n"
-            "- `day, volume_sol, tokens_created, volume_per_token`\n"
-            "- `day, volume, tokens_created, volume_per_token`\n\n"
+            "Your Dune query must return:\n"
+            "- `day, volume_sol (or volume), tokens_created, graduated_tokens, grad_rate, median_minutes_to_grad`\n\n"
             f"Missing: {missing}\n\n"
             f"Columns found: {list(out.columns)}"
         )
@@ -183,7 +102,7 @@ def pick_columns(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 # ----------------------------
-# Regime math (4-factor)
+# Regime math (new 4-factor)
 # ----------------------------
 def clamp(x, lo=0.0, hi=1.0):
     return max(lo, min(hi, x))
@@ -197,42 +116,55 @@ def norm_log_ratio(r: float, k: float) -> float:
         return 0.0
     return clamp(0.5 + k * float(np.log(r)))
 
-def score_from_4_ratios(vol_ratio: float, vpt_ratio: float, tokens_ratio: float, grad_ratio: float) -> int:
+def score_from_metrics(vol_ratio: float, grad_ratio: float, grad_speed_ratio: float, tokens_ratio: float) -> int:
     """
-    4-factor regime score:
+    New 4-factor regime score (VPT removed):
 
-      Quality (VPT vs median)          30%
-      Flow    (Volume vs median)       25%
-      Crowding inverse (Tokens vs med) 15%  (more tokens => worse)
-      Graduation (Grad rate vs median) 30%
+      Graduation likelihood (grad_rate vs median) 35%
+      Graduation speed (faster vs median)         30%  (lower minutes_to_grad is better -> we invert into a ratio)
+      Flow (volume vs median)                     20%
+      Crowding inverse (tokens vs median)         15%  (more tokens => worse)
 
-    Graduation is the "market produces winners" signal.
+    Interpretation:
+      - High grad_rate + fast speed => runner environment
+      - Slow speed is a key bearish tell even if volume is high
     """
-    quality = norm_log_ratio(vpt_ratio, k=0.45)
     flow = norm_log_ratio(vol_ratio, k=0.35)
+    grad = norm_log_ratio(grad_ratio, k=0.60)
+    speed = norm_log_ratio(grad_speed_ratio, k=0.50)
 
     lt = np.log(tokens_ratio) if tokens_ratio and np.isfinite(tokens_ratio) and tokens_ratio > 0 else 0.0
     crowd = clamp(0.5 - 0.30 * lt)
 
-    grad = norm_log_ratio(grad_ratio, k=0.60)
-
     raw = (
-        0.30 * quality +
-        0.25 * flow +
-        0.15 * crowd +
-        0.30 * grad
+        0.20 * flow +
+        0.35 * grad +
+        0.30 * speed +
+        0.15 * crowd
     )
     return int(round(100 * clamp(raw)))
 
-def regime_label(vol_ratio: float, vpt_ratio: float, tokens_ratio: float, grad_ratio: float):
-    if grad_ratio >= 1.10 and vpt_ratio >= 1.05 and vol_ratio >= 1.00 and tokens_ratio <= 1.20:
-        return "GREEN", "Strong winners + quality flow"
+def regime_label(vol_ratio: float, tokens_ratio: float, grad_ratio: float, grad_speed_ratio: float):
+    """
+    Labels tuned for "runner likelihood".
 
+    grad_speed_ratio > 1 means faster-than-median graduation.
+    """
+    # GREEN: high grad + fast speed (continuation more likely)
+    if grad_ratio >= 1.10 and grad_speed_ratio >= 1.10 and tokens_ratio <= 1.25:
+        return "GREEN", "High graduations + fast bonding curve (runner environment)"
+
+    # RED: low graduations = environment not producing winners
     if grad_ratio < 0.85:
         return "RED", "Low graduations (bad environment)"
 
-    if vpt_ratio < 0.90 and tokens_ratio > 1.05:
-        return "RED", "Crowded + low quality"
+    # RED: slow speed (even if volume exists) -> grind/distribution
+    if grad_speed_ratio < 0.85:
+        return "RED", "Slow graduations (grind/distribution; fewer runners)"
+
+    # RED: crowded + weak grads
+    if tokens_ratio > 1.20 and grad_ratio < 1.00:
+        return "RED", "Crowded + not enough winners"
 
     return "YELLOW", "Mixed / transition"
 
@@ -242,27 +174,29 @@ def regime_badge(regime: str) -> str:
 def compute_features(df: pd.DataFrame, window: int) -> pd.DataFrame:
     d = df.copy().sort_values("day")
 
+    # rolling medians
     d["vol_med"] = d["volume"].rolling(window).median()
     d["tok_med"] = d["tokens_created"].rolling(window).median()
-    d["vpt_med"] = d["volume_per_token"].rolling(window).median()
+    d["grad_med"] = d["grad_rate"].rolling(window).median()
 
+    # grad speed median (minutes)
+    d["grad_minutes_med"] = d["median_minutes_to_grad"].rolling(window).median()
+
+    # ratios vs rolling medians
     d["vol_ratio"] = d["volume"] / d["vol_med"]
     d["tokens_ratio"] = d["tokens_created"] / d["tok_med"]
-    d["vpt_ratio"] = d["volume_per_token"] / d["vpt_med"]
+    d["grad_ratio"] = d["grad_rate"] / d["grad_med"]
 
-    if "grad_rate" in d.columns:
-        d["grad_med"] = d["grad_rate"].rolling(window).median()
-        d["grad_ratio"] = d["grad_rate"] / d["grad_med"]
-    else:
-        d["grad_rate"] = np.nan
-        d["grad_med"] = np.nan
-        d["grad_ratio"] = np.nan
+    # IMPORTANT: faster = lower minutes => bullish => invert:
+    # ratio > 1 => faster-than-median graduation
+    d["grad_speed_ratio"] = d["grad_minutes_med"] / d["median_minutes_to_grad"]
 
+    # score
     d["regime_score"] = d.apply(
-        lambda r: score_from_4_ratios(
-            r["vol_ratio"], r["vpt_ratio"], r["tokens_ratio"], r["grad_ratio"]
+        lambda r: score_from_metrics(
+            r["vol_ratio"], r["grad_ratio"], r["grad_speed_ratio"], r["tokens_ratio"]
         )
-        if pd.notna(r["vol_ratio"]) and pd.notna(r["vpt_ratio"]) and pd.notna(r["tokens_ratio"]) and pd.notna(r["grad_ratio"])
+        if pd.notna(r["vol_ratio"]) and pd.notna(r["grad_ratio"]) and pd.notna(r["grad_speed_ratio"]) and pd.notna(r["tokens_ratio"])
         else np.nan,
         axis=1,
     )
@@ -270,20 +204,29 @@ def compute_features(df: pd.DataFrame, window: int) -> pd.DataFrame:
     return d
 
 # ----------------------------
-# Data load / refresh logic (single-source action)
+# Session state
+# ----------------------------
+if "last_execution_id" not in st.session_state:
+    st.session_state["last_execution_id"] = None
+if "last_refresh_mode" not in st.session_state:
+    st.session_state["last_refresh_mode"] = "cached"
+if "last_fresh_state" not in st.session_state:
+    st.session_state["last_fresh_state"] = None
+if "data_origin" not in st.session_state:
+    st.session_state["data_origin"] = "cached"
+
+# ----------------------------
+# Data load / refresh logic (resilient)
 # ----------------------------
 df = None
-action = st.session_state.get("refresh_action", None)
 
-# Fast refresh: clear cache then load cached results
-if action == "fast":
+if fast_refresh:
     st.cache_data.clear()
     st.session_state["last_refresh_mode"] = "cached"
     st.session_state["data_origin"] = "cached"
     st.session_state["last_fresh_state"] = None
 
-# Retry fetch: attempt to fetch results for last execution without re-running
-if action == "retry":
+if retry_fetch:
     exid = st.session_state.get("last_execution_id")
     if not exid:
         st.info("No previous fresh execution found. Click “Run Fresh Query” first.")
@@ -310,8 +253,7 @@ if action == "retry":
             st.session_state["last_refresh_mode"] = "cached"
             st.session_state["data_origin"] = "cached"
 
-# Run fresh: trigger new execution, wait best-effort, fetch if ready; otherwise fall back
-if action == "fresh" and df is None:
+if run_fresh and df is None:
     try:
         with st.spinner("Triggering fresh Dune execution..."):
             execution_id, df_fresh, state = try_run_and_fetch(
@@ -339,62 +281,48 @@ if action == "fresh" and df is None:
         st.session_state["last_refresh_mode"] = "cached"
         st.session_state["data_origin"] = "cached"
 
-# Default: cached results
 if df is None:
     df = load_data_cached(query_id, api_key)
     st.session_state["last_refresh_mode"] = "cached"
     st.session_state["data_origin"] = "cached"
-
-# IMPORTANT: clear action so it doesn't retrigger on the next rerun
-st.session_state["refresh_action"] = None
 
 # ----------------------------
 # Clean + normalize schema
 # ----------------------------
 df = pick_columns(df)
 
-for col in ["volume", "tokens_created", "volume_per_token"]:
+for col in ["volume", "tokens_created", "graduated_tokens", "grad_rate", "median_minutes_to_grad"]:
     df[col] = pd.to_numeric(df[col], errors="coerce")
 
-if "grad_rate" in df.columns:
-    df["grad_rate"] = pd.to_numeric(df["grad_rate"], errors="coerce")
-if "graduated_tokens" in df.columns:
-    df["graduated_tokens"] = pd.to_numeric(df["graduated_tokens"], errors="coerce")
-
-df = df.dropna(subset=["day", "volume", "tokens_created"])
+df = df.dropna(subset=["day", "volume", "tokens_created", "grad_rate", "median_minutes_to_grad"])
 df = normalize_day(df)
 
 # ----------------------------
 # Feature engineering
 # ----------------------------
+window = max(7, int(lookback))
 df_feat = compute_features(df, window)
-
-df_valid = (
-    df_feat[df_feat["regime_score"].notna()]
-    .sort_values("day")
-    .tail(int(lookback))
-)
+df_valid = df_feat[df_feat["regime_score"].notna()].sort_values("day").tail(int(lookback))
 
 if df_valid.empty:
-    if "grad_rate" not in df.columns:
-        st.error("Your Dune query is missing `grad_rate`. Add it to the SQL output to use the 4-factor model.")
-    else:
-        st.warning("Not enough data to compute rolling medians yet. Increase history in Dune or increase lookback.")
+    st.warning("Not enough data to compute rolling medians yet. Increase history in Dune or increase lookback.")
     st.stop()
 
 latest = df_valid.iloc[-1]
 vol_ratio = float(latest["vol_ratio"])
 tok_ratio = float(latest["tokens_ratio"])
-vpt_ratio = float(latest["vpt_ratio"])
-grad_rate = float(latest["grad_rate"]) if pd.notna(latest["grad_rate"]) else np.nan
+grad_rate = float(latest["grad_rate"])
 grad_ratio = float(latest["grad_ratio"])
+grad_speed_ratio = float(latest["grad_speed_ratio"])
+minutes_to_grad = float(latest["median_minutes_to_grad"])
 score = int(latest["regime_score"])
-regime, rationale = regime_label(vol_ratio, vpt_ratio, tok_ratio, grad_ratio)
+
+regime, rationale = regime_label(vol_ratio, tok_ratio, grad_ratio, grad_speed_ratio)
 
 # ----------------------------
 # TOP KPIs
 # ----------------------------
-c1, c2, c3, c4, c5, c6 = st.columns([1.2, 1.3, 1.1, 1.4, 1.4, 1.4])
+c1, c2, c3, c4, c5, c6 = st.columns([1.2, 1.3, 1.1, 1.4, 1.4, 1.6])
 
 with c1:
     st.caption("Regime")
@@ -411,23 +339,29 @@ with c3:
     st.metric(label="", value=f"{vol_ratio:.2f}x")
 
 with c4:
-    st.caption("Quality ratio (Vol/Token vs median)")
-    st.metric(label="", value=f"{vpt_ratio:.2f}x")
+    st.caption("Graduation ratio (vs median)")
+    st.metric(label="", value=f"{grad_ratio:.2f}x")
+    st.caption(f"Today grad rate: {grad_rate*100:.2f}%")
 
 with c5:
+    st.caption("Graduation speed (vs median)")
+    st.metric(label="", value=f"{grad_speed_ratio:.2f}x")
+    st.caption(f"Median minutes to grad: {minutes_to_grad:.2f} min")
+
+with c6:
     st.caption("Crowding ratio (Tokens vs median)")
     st.metric(label="", value=f"{tok_ratio:.2f}x")
     st.caption(f"Rolling median window: {window}d")
 
-with c6:
-    st.caption("Graduation ratio (Grad rate vs median)")
-    st.metric(label="", value=f"{grad_ratio:.2f}x")
-    if np.isfinite(grad_rate):
-        st.caption(f"Today grad rate: {grad_rate*100:.2f}%")
-    else:
-        st.caption("Today grad rate: n/a")
-
-st.divider()
+# Mobile-friendly lookback control (main page)
+lookback = st.slider(
+    "Rolling window (days)",
+    min_value=7,
+    max_value=60,
+    value=default_lookback,
+    step=1,
+    help="Controls the rolling median window used to compute the ratios + regime score.",
+)
 
 # ----------------------------
 # Freshness / execution info
@@ -463,8 +397,7 @@ if max_day is not None:
 if row_count is not None:
     fresh_bits.append(f"Rows: **{row_count}**")
 
-st.caption(" | ".join(fresh_bits) if fresh_bits else "🧠 Freshness info unavailable (query not returning as_of_ts/day_rows/max_day).")
-
+st.caption(" | ".join(fresh_bits) if fresh_bits else "🧠 Freshness info unavailable.")
 if origin == "fresh" and exec_id:
     st.caption(f"Origin: **fresh** (execution_id: `{exec_id}`)")
 elif exec_id and state and state != "QUERY_STATE_COMPLETED":
@@ -492,7 +425,7 @@ with left:
     )
 with right:
     st.plotly_chart(
-        px.line(df_valid, x="day", y="vpt_ratio", title="Quality Ratio (vol/token vs rolling median)"),
+        px.line(df_valid, x="day", y="grad_ratio", title="Graduation Ratio (grad_rate vs rolling median)"),
         use_container_width=True,
     )
 
@@ -504,13 +437,11 @@ with midl:
     )
 with midr:
     st.plotly_chart(
-        px.line(df_valid, x="day", y="grad_ratio", title="Graduation Ratio (grad_rate vs rolling median)"),
+        px.line(df_valid, x="day", y="grad_speed_ratio", title="Graduation Speed Ratio (faster is higher)"),
         use_container_width=True,
     )
 
-# ----------------------------
 # Optional: raw charts (debug)
-# ----------------------------
 with st.expander("Optional: Raw series (for debugging only)", expanded=False):
     st.caption("Raw units from events tables; use ratios above for decisions.")
     l2, r2 = st.columns(2)
@@ -519,11 +450,9 @@ with st.expander("Optional: Raw series (for debugging only)", expanded=False):
     with r2:
         st.plotly_chart(px.bar(df_feat, x="day", y="tokens_created", title="Tokens Created (raw count)"), use_container_width=True)
 
-    if "graduated_tokens" in df_feat.columns:
-        st.plotly_chart(px.bar(df_feat, x="day", y="graduated_tokens", title="Graduated Tokens (raw count)"), use_container_width=True)
-
-    if "grad_rate" in df_feat.columns:
-        st.plotly_chart(px.line(df_feat, x="day", y="grad_rate", title="Graduation Rate (raw)"), use_container_width=True)
+    st.plotly_chart(px.bar(df_feat, x="day", y="graduated_tokens", title="Graduated Tokens (raw count)"), use_container_width=True)
+    st.plotly_chart(px.line(df_feat, x="day", y="grad_rate", title="Graduation Rate (raw)"), use_container_width=True)
+    st.plotly_chart(px.line(df_feat, x="day", y="median_minutes_to_grad", title="Median Minutes to Graduate (raw)"), use_container_width=True)
 
 with st.expander("Recent rows (ratios only)", expanded=False):
     cols = [
@@ -531,10 +460,11 @@ with st.expander("Recent rows (ratios only)", expanded=False):
         "tokens_created",
         "graduated_tokens",
         "grad_rate",
+        "median_minutes_to_grad",
         "vol_ratio",
         "tokens_ratio",
-        "vpt_ratio",
         "grad_ratio",
+        "grad_speed_ratio",
         "regime_score",
     ]
     cols = [c for c in cols if c in df_feat.columns]
